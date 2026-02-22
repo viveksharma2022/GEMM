@@ -3,8 +3,9 @@
 #include <stdio.h>
 #include <cuda_fp16.h>
 #include <vector>
-#include <iostream>
 #include <type_traits>
+#include <iostream>
+#include "utils.hpp"
 
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
@@ -105,12 +106,7 @@ std::vector<type_C> C(M*N, 0.0f);
 
     // Print result
     std::cout << "Result matrix C:\n";
-    for (int i = 0; i < M; i++) {
-        for (int j = 0; j < N; j++) {
-            std::cout << C[i*N + j] << " ";
-        }
-        std::cout << "\n";
-    }
+    Utils::Print_Vector(C, M, N);
 
     cuda_check(cudaFree(d_A));
     cuda_check(cudaFree(d_B));

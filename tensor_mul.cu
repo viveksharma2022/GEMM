@@ -321,11 +321,14 @@ __global__ void lds_load_vec(
     TC* __restrict__ C,
     int M, int N, int K)
 {
-    constexpr int PAD = 8;
+    constexpr int PAD = 4;
 
     // int2 = 8 bytes = 4 half
-    constexpr int VEC = 8;  // number of half elements per int2 load
-    using DT = int4;
+    constexpr int VEC1 = 16;  // number of half elements per int2 load
+    constexpr int VEC2 = 16;  // number of half elements per int2 load
+
+    using DT1 = int4;
+    using DT2 = int4;
 
     // Shared tiles with padding to reduce bank conflicts
     __shared__ TA sA[BLOCK_M][BLOCK_K + PAD];
@@ -341,19 +344,19 @@ __global__ void lds_load_vec(
     // vectorized global memory views
     //--------------------------------
 
-    const DT* A_vec = reinterpret_cast<const DT*>(A);
-    const DT* B_vec = reinterpret_cast<const DT*>(B);
+    const DT1* A_vec = reinterpret_cast<const DT1*>(A);
+    const DT2* B_vec = reinterpret_cast<const DT2*>(B);
 
-    DT* sA_vec = reinterpret_cast<DT*>(sA);
-    DT* sB_vec = reinterpret_cast<DT*>(sB);
+    DT1* sA_vec = reinterpret_cast<DT1*>(sA);
+    DT2* sB_vec = reinterpret_cast<DT2*>(sB);
 
     //--------------------------------
     // tile dimensions in vector units
     //--------------------------------
 
     // number of int2 loads per row 
-    constexpr int A_VEC_WIDTH = BLOCK_K / VEC;  // 128 / 4 = 32 // comments not correct
-    constexpr int B_VEC_WIDTH = BLOCK_N / VEC;  // 128 / 4 = 32
+    constexpr int A_VEC_WIDTH = BLOCK_K / VEC1;  // 128 / 4 = 32 // comments not correct
+    constexpr int B_VEC_WIDTH = BLOCK_N / VEC2;  // 128 / 4 = 32
 
     // total vector loads required to fill each tile
     constexpr int A_VEC_COUNT = BLOCK_M * A_VEC_WIDTH; // 16 * 32 = 512
@@ -371,9 +374,9 @@ __global__ void lds_load_vec(
 
         // global index in int2 units
         int gmem =
-            (blockRow + row) * (K / VEC) + col;
+            (blockRow + row) * (K / VEC1) + col;
 
-        sA_vec[row * ((BLOCK_K + PAD) / VEC) + col] =
+        sA_vec[row * ((BLOCK_K + PAD) / VEC1) + col] =
             A_vec[gmem];
     }
 
@@ -389,9 +392,9 @@ __global__ void lds_load_vec(
 
         // global index in int2 units
         int gmem =
-            row * (N / VEC) + (blockCol / VEC) + col;
+            row * (N / VEC2) + (blockCol / VEC2) + col;
 
-        sB_vec[row * ((BLOCK_N + PAD) / VEC) + col] =
+        sB_vec[row * ((BLOCK_N + PAD) / VEC2) + col] =
             B_vec[gmem];
     }
 
@@ -401,19 +404,32 @@ __global__ void lds_load_vec(
     // placeholder compute
     //--------------------------------
 
-    int row = threadIdx.x % BLOCK_M;
-    int col = threadIdx.x % BLOCK_N;
+    //--------------------------------
+    // simple coalesced store
+    //--------------------------------
 
-    float val = 0.0f;
-
-    for (int k = 0; k < BLOCK_K; k++)
+    #pragma unroll
+    for (int i = tid; i < BLOCK_M * BLOCK_N; i += blockDim.x)
     {
-        val += __half2float(sA[row][k]) *
-               __half2float(sB[k][col]);
-    }
+        int row = i / BLOCK_N;
+        int col = i % BLOCK_N;
 
-    if (blockRow + row < M && blockCol + col < N)
-        C[(blockRow + row) * N + (blockCol + col)] = val;
+        int global_row = blockRow + row;
+        int global_col = blockCol + col;
+
+        float val = 0.0f;
+
+        for (int k = 0; k < BLOCK_K; k++)
+        {
+            val += __half2float(sA[row][k]) *
+                __half2float(sB[k][col]);
+        }
+
+        if (global_row < M && global_col < N)
+        {
+            C[global_row * N + global_col] = val;
+        }
+    }
 }
 
 int main(){
@@ -444,10 +460,10 @@ int main(){
                           B.size() * sizeof(type_B),
                           cudaMemcpyHostToDevice));
 
-    constexpr int BLOCK_M = 32;  // 4 WMMAs tall (4*16)
-    constexpr int BLOCK_N = 64;  // 4 WMMAs wide (4*16)
-    constexpr int BLOCK_K = 64;  // 4 WMMAs deep (4*16)
-    constexpr int threadBlockSize = 256;  // 16 warps, each thread loads 64 bytes
+    constexpr int BLOCK_M = 16;  // 4 WMMAs tall (4*16)
+    constexpr int BLOCK_N = 128;  // 4 WMMAs wide (4*16)
+    constexpr int BLOCK_K = 128;  // 4 WMMAs deep (4*16)
+    constexpr int threadBlockSize = 512;  // 16 warps, each thread loads 64 bytes
 
     dim3 dim_block(threadBlockSize);
     dim3 dim_grid(N / BLOCK_N, M / BLOCK_M);

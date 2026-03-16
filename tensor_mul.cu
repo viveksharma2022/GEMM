@@ -324,11 +324,9 @@ __global__ void lds_load_vec(
     constexpr int PAD = 4;
 
     // int2 = 8 bytes = 4 half
-    constexpr int VEC1 = 16;  // number of half elements per int2 load
-    constexpr int VEC2 = 16;  // number of half elements per int2 load
+    constexpr int VEC = 16;  // number of half elements per int2 load
 
-    using DT1 = int4;
-    using DT2 = int4;
+    using DT = int4;
 
     // Shared tiles with padding to reduce bank conflicts
     __shared__ TA sA[BLOCK_M][BLOCK_K + PAD];
@@ -344,19 +342,19 @@ __global__ void lds_load_vec(
     // vectorized global memory views
     //--------------------------------
 
-    const DT1* A_vec = reinterpret_cast<const DT1*>(A);
-    const DT2* B_vec = reinterpret_cast<const DT2*>(B);
+    const DT* A_vec = reinterpret_cast<const DT*>(A);
+    const DT* B_vec = reinterpret_cast<const DT*>(B);
 
-    DT1* sA_vec = reinterpret_cast<DT1*>(sA);
-    DT2* sB_vec = reinterpret_cast<DT2*>(sB);
+    DT* sA_vec = reinterpret_cast<DT*>(sA);
+    DT* sB_vec = reinterpret_cast<DT*>(sB);
 
     //--------------------------------
     // tile dimensions in vector units
     //--------------------------------
 
     // number of int2 loads per row 
-    constexpr int A_VEC_WIDTH = BLOCK_K / VEC1;  // 128 / 4 = 32 // comments not correct
-    constexpr int B_VEC_WIDTH = BLOCK_N / VEC2;  // 128 / 4 = 32
+    constexpr int A_VEC_WIDTH = BLOCK_K / VEC;  // 128 / 4 = 32 // comments not correct
+    constexpr int B_VEC_WIDTH = BLOCK_N / VEC;  // 128 / 4 = 32
 
     // total vector loads required to fill each tile
     constexpr int A_VEC_COUNT = BLOCK_M * A_VEC_WIDTH; // 16 * 32 = 512
@@ -374,9 +372,9 @@ __global__ void lds_load_vec(
 
         // global index in int2 units
         int gmem =
-            (blockRow + row) * (K / VEC1) + col;
+            (blockRow + row) * (K / VEC) + col;
 
-        sA_vec[row * ((BLOCK_K + PAD) / VEC1) + col] =
+        sA_vec[row * ((BLOCK_K + PAD) / VEC) + col] =
             A_vec[gmem];
     }
 
@@ -392,9 +390,9 @@ __global__ void lds_load_vec(
 
         // global index in int2 units
         int gmem =
-            row * (N / VEC2) + (blockCol / VEC2) + col;
+            row * (N / VEC) + (blockCol / VEC) + col;
 
-        sB_vec[row * ((BLOCK_N + PAD) / VEC2) + col] =
+        sB_vec[row * ((BLOCK_N + PAD) / VEC) + col] =
             B_vec[gmem];
     }
 

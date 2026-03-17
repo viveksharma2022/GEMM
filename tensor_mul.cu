@@ -312,25 +312,25 @@ template<
     typename TA,
     typename TB,
     typename TC,
-    int BLOCK_M = 16,
-    int BLOCK_N = 128,
-    int BLOCK_K = 128>
+    int BLOCK_M = 64,
+    int BLOCK_N = 64,
+    int BLOCK_K = 64>
 __global__ void lds_load_vec(
     const TA* __restrict__ A,
     const TB* __restrict__ B,
     TC* __restrict__ C,
     int M, int N, int K)
 {
-    constexpr int PAD = 4;
+    constexpr int PAD = 8;
 
     // int2 = 8 bytes = 4 half
-    constexpr int VEC = 16;  // number of half elements per int2 load
+    constexpr int VEC = 8;  // number of half elements per int2 load
 
-    using DT = int4;
+    using DT = int2;
 
     // Shared tiles with padding to reduce bank conflicts
-    __shared__ TA sA[BLOCK_M][BLOCK_K + PAD];
-    __shared__ TB sB[BLOCK_K][BLOCK_N + PAD];
+    __shared__ __shared__ __align__(128) TA sA[BLOCK_M][BLOCK_K + PAD];
+    __shared__ __shared__ __align__(128) TB sB[BLOCK_K][BLOCK_N + PAD];
 
     int tid = threadIdx.x;
 
@@ -345,59 +345,83 @@ __global__ void lds_load_vec(
     const DT* A_vec = reinterpret_cast<const DT*>(A);
     const DT* B_vec = reinterpret_cast<const DT*>(B);
 
-    DT* sA_vec = reinterpret_cast<DT*>(sA);
-    DT* sB_vec = reinterpret_cast<DT*>(sB);
-
     //--------------------------------
     // tile dimensions in vector units
     //--------------------------------
 
     // number of int2 loads per row 
-    constexpr int A_VEC_WIDTH = BLOCK_K / VEC;  // 128 / 4 = 32 // comments not correct
-    constexpr int B_VEC_WIDTH = BLOCK_N / VEC;  // 128 / 4 = 32
+    constexpr int A_VEC_WIDTH = BLOCK_K / VEC;  // 64 / 8 = 8
+    constexpr int B_VEC_WIDTH = BLOCK_N / VEC;  // 64 / 8 = 8
 
     // total vector loads required to fill each tile
-    constexpr int A_VEC_COUNT = BLOCK_M * A_VEC_WIDTH; // 16 * 32 = 512
-    constexpr int B_VEC_COUNT = BLOCK_K * B_VEC_WIDTH; // 128 * 32 = 4096
+    constexpr int A_VEC_COUNT = BLOCK_M * A_VEC_WIDTH; // 64 * 8 = 512
+    constexpr int B_VEC_COUNT = BLOCK_K * B_VEC_WIDTH; // 64 * 8 = 512
 
+    for(int k = 0; k < K; k += BLOCK_K){
     //--------------------------------
-    // load A tile (BLOCK_M x BLOCK_K)
-    //--------------------------------
+        // load A tile (BLOCK_M x BLOCK_K)
+        //--------------------------------
 
-    #pragma unroll
-    for (int i = tid; i < A_VEC_COUNT; i += blockDim.x)
-    {
-        int row = i / A_VEC_WIDTH;
-        int col = i % A_VEC_WIDTH;
+        #pragma unroll
+        for (int i = tid; i < A_VEC_COUNT; i += blockDim.x)
+        {
+            int row = i / A_VEC_WIDTH;
+            int col = i % A_VEC_WIDTH;
 
-        // global index in int2 units
-        int gmem =
-            (blockRow + row) * (K / VEC) + col;
+            // global index in int2 units
+            int gmem =
+                (blockRow + row) * (K / VEC) + col + (k / VEC);
 
-        sA_vec[row * ((BLOCK_K + PAD) / VEC) + col] =
-            A_vec[gmem];
+            DT* sA_vec = reinterpret_cast<DT*>(&sA[row][col*VEC]);
+            *sA_vec = A_vec[gmem];
+        }
+
+        //--------------------------------
+        // load B tile (BLOCK_K x BLOCK_N)
+        //--------------------------------
+
+        #pragma unroll
+        for (int i = tid; i < B_VEC_COUNT; i += blockDim.x)
+        {
+            int row = i / B_VEC_WIDTH;
+            int col = i % B_VEC_WIDTH;
+
+            // global index in int2 units
+            int gmem =
+                (k + row) * (N / VEC) + (blockCol / VEC) + col;
+                
+
+            DT* sB_vec = reinterpret_cast<DT*>(&sB[row][col*VEC]);
+            *sB_vec = B_vec[gmem];
+        }
+
+        __syncthreads();
+
+            // WMMA compute: 16 tiles per block
+        int tile = 0;
+        for (int i = 0; i < BLOCK_M; i += WMMA_M) {       // 4 rows
+            for (int j = 0; j < BLOCK_N; j += WMMA_N) {   // 4 cols
+                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+                wmma::fill_fragment(c_frag, 0.0f);
+
+                for (int t = 0; t < BLOCK_K; t += WMMA_K) {
+                    wmma::load_matrix_sync(a_frag, &sA[i][t], BLOCK_K + PAD);
+                    wmma::load_matrix_sync(b_frag, &sB[t][j], BLOCK_N + PAD);
+                    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+                }
+
+                wmma::store_matrix_sync(&C[(blockRow + i) * N + (blockCol + j)], c_frag, N, wmma::mem_row_major);
+                tile++;
+            }
+        }
+
+        __syncthreads();
+
     }
-
-    //--------------------------------
-    // load B tile (BLOCK_K x BLOCK_N)
-    //--------------------------------
-
-    #pragma unroll
-    for (int i = tid; i < B_VEC_COUNT; i += blockDim.x)
-    {
-        int row = i / B_VEC_WIDTH;
-        int col = i % B_VEC_WIDTH;
-
-        // global index in int2 units
-        int gmem =
-            row * (N / VEC) + (blockCol / VEC) + col;
-
-        sB_vec[row * ((BLOCK_N + PAD) / VEC) + col] =
-            B_vec[gmem];
-    }
-
-    __syncthreads();
-
+ 
     //--------------------------------
     // placeholder compute
     //--------------------------------
@@ -406,37 +430,53 @@ __global__ void lds_load_vec(
     // simple coalesced store
     //--------------------------------
 
-    #pragma unroll
-    for (int i = tid; i < BLOCK_M * BLOCK_N; i += blockDim.x)
-    {
-        int row = i / BLOCK_N;
-        int col = i % BLOCK_N;
+    // #pragma unroll
+    // for (int i = tid; i < BLOCK_M * BLOCK_N; i += blockDim.x)
+    // {
+    //     int row = i / BLOCK_N;
+    //     int col = i % BLOCK_N;
 
-        int global_row = blockRow + row;
-        int global_col = blockCol + col;
+    //     int global_row = blockRow + row;
+    //     int global_col = blockCol + col;
 
-        float val = 0.0f;
+    //     float val = 0.0f;
 
-        for (int k = 0; k < BLOCK_K; k++)
-        {
-            val += __half2float(sA[row][k]) *
-                __half2float(sB[k][col]);
-        }
+    //     for (int k = 0; k < BLOCK_K; k++)
+    //     {
+    //         val += __half2float(sA[row][k]) *
+    //             __half2float(sB[k][col]);
+    //     }
 
-        if (global_row < M && global_col < N)
-        {
-            C[global_row * N + global_col] = val;
-        }
-    }
+    //     if (global_row < M && global_col < N)
+    //     {
+    //         C[global_row * N + global_col] = val;
+    //     }
+    // }
 }
 
 int main(){
 
+
+    int device = 0;
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+
+    std::cout << "Max shared memory per block: " 
+              << prop.sharedMemPerBlock / 1024.0f 
+              << " KB\n";
+
+    std::cout << "Max shared memory per multiprocessor: "
+              << prop.sharedMemPerMultiprocessor / 1024.0f
+              << " KB\n";
+
+    std::cout << "Compute capability: "
+              << prop.major << "." << prop.minor << "\n";
+    
     using type_A = __half;
     using type_B = __half;
     using type_C = float;
 
-    int M = 8 * 1024, N = 8 * 1024, K = 64 * 1024;
+    int M = 2 * 1024, N = 2 * 1024, K = 32 * 1024;
 
     // constexpr size_t N_TILES = 4; // Number of tiles to compute per block (for shared_memory_increase_tensor_mat_mul_kernel)
 
@@ -458,10 +498,10 @@ int main(){
                           B.size() * sizeof(type_B),
                           cudaMemcpyHostToDevice));
 
-    constexpr int BLOCK_M = 16;  // 4 WMMAs tall (4*16)
-    constexpr int BLOCK_N = 128;  // 4 WMMAs wide (4*16)
-    constexpr int BLOCK_K = 128;  // 4 WMMAs deep (4*16)
-    constexpr int threadBlockSize = 512;  // 16 warps, each thread loads 64 bytes
+    constexpr int BLOCK_M = 64;  // 4 WMMAs tall (4*16)
+    constexpr int BLOCK_N = 64;  // 4 WMMAs wide (4*16)
+    constexpr int BLOCK_K = 64;  // 4 WMMAs deep (4*16)
+    constexpr int threadBlockSize = 256;  // 16 warps, each thread loads 64 bytes
 
     dim3 dim_block(threadBlockSize);
     dim3 dim_grid(N / BLOCK_N, M / BLOCK_M);

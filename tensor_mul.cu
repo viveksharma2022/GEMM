@@ -308,119 +308,127 @@ __global__ void lds_load(
 }
 
 
-template<
+#include <mma.h>
+#include <cuda_fp16.h>
+using namespace nvcuda;
+
+template <
     typename TA,
     typename TB,
     typename TC,
     int BLOCK_M = 64,
     int BLOCK_N = 64,
     int BLOCK_K = 64>
-__global__ void lds_load_vec(
+__global__ void wmma_safe_kernel(
     const TA* __restrict__ A,
     const TB* __restrict__ B,
     TC* __restrict__ C,
     int M, int N, int K)
 {
-    constexpr int PAD = 8;
+    constexpr int PAD = 8;                  // padding to reduce bank conflicts
+    constexpr int VEC = 8;                  // half elements per int2 load
+    using DT = int4;                        // vectorized type for global memory
 
-    // int2 = 8 bytes = 4 half
-    constexpr int VEC = 8;  // number of half elements per int2 load
+    // WMMA tile size
+    constexpr int WMMA_M = 16;
+    constexpr int WMMA_N = 16;
+    constexpr int WMMA_K = 16;
 
-    using DT = int2;
-
-    // Shared tiles with padding to reduce bank conflicts
-    __shared__ __shared__ __align__(128) TA sA[BLOCK_M][BLOCK_K + PAD];
-    __shared__ __shared__ __align__(128) TB sB[BLOCK_K][BLOCK_N + PAD];
+    // Shared memory tiles
+    __shared__ __align__(16) TA sA[BLOCK_M][BLOCK_K + PAD];
+    __shared__ __align__(16) TB sB[BLOCK_K][BLOCK_N + PAD];
 
     int tid = threadIdx.x;
+    int warpId = tid / 32;
+    int laneId = tid % 32;
 
-    // Output tile coordinates
+    // Block coordinates in global matrix
     int blockRow = blockIdx.y * BLOCK_M;
     int blockCol = blockIdx.x * BLOCK_N;
 
-    //--------------------------------
-    // vectorized global memory views
-    //--------------------------------
+    // Warp layout inside block
+    constexpr int WARPS_PER_ROW = BLOCK_N / WMMA_N;  // 64/16 = 4
+    int warpRow = warpId / WARPS_PER_ROW;
+    int warpCol = warpId % WARPS_PER_ROW;
 
+    int tileRow = warpRow * WMMA_M; // starting row of this warp's tile
+    int tileCol = warpCol * WMMA_N; // starting col of this warp's tile
+
+    // Vectorized global memory views
     const DT* A_vec = reinterpret_cast<const DT*>(A);
     const DT* B_vec = reinterpret_cast<const DT*>(B);
 
-    //--------------------------------
-    // tile dimensions in vector units
-    //--------------------------------
+    constexpr int A_VEC_WIDTH = BLOCK_K / VEC;
+    constexpr int B_VEC_WIDTH = BLOCK_N / VEC;
+    constexpr int A_VEC_COUNT = BLOCK_M * A_VEC_WIDTH;
+    constexpr int B_VEC_COUNT = BLOCK_K * B_VEC_WIDTH;
 
-    // number of int2 loads per row 
-    constexpr int A_VEC_WIDTH = BLOCK_K / VEC;  // 64 / 8 = 8
-    constexpr int B_VEC_WIDTH = BLOCK_N / VEC;  // 64 / 8 = 8
+    // Accumulator fragment
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, TC> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
 
-    // total vector loads required to fill each tile
-    constexpr int A_VEC_COUNT = BLOCK_M * A_VEC_WIDTH; // 64 * 8 = 512
-    constexpr int B_VEC_COUNT = BLOCK_K * B_VEC_WIDTH; // 64 * 8 = 512
+    // Loop over K dimension in BLOCK_K chunks
+    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
 
-    for(int k = 0; k < K; k += BLOCK_K){
-    //--------------------------------
-        // load A tile (BLOCK_M x BLOCK_K)
-        //--------------------------------
-
-        #pragma unroll
-        for (int i = tid; i < A_VEC_COUNT; i += blockDim.x)
-        {
+        // ------------------------
+        // Load A tile into shared memory (vectorized)
+        // ------------------------
+        for (int i = tid; i < A_VEC_COUNT; i += blockDim.x) {
             int row = i / A_VEC_WIDTH;
             int col = i % A_VEC_WIDTH;
 
-            // global index in int2 units
-            int gmem =
-                (blockRow + row) * (K / VEC) + col + (k / VEC);
+            int globalRow = blockRow + row;
+            int globalCol = k0 + col * VEC;
 
-            DT* sA_vec = reinterpret_cast<DT*>(&sA[row][col*VEC]);
-            *sA_vec = A_vec[gmem];
+            if (globalRow < M && globalCol + VEC <= K) {
+                DT* sA_vec = reinterpret_cast<DT*>(&sA[row][col * VEC]);
+                *sA_vec = A_vec[(globalRow * (K / VEC)) + (globalCol / VEC)];
+            }
         }
 
-        //--------------------------------
-        // load B tile (BLOCK_K x BLOCK_N)
-        //--------------------------------
-
-        #pragma unroll
-        for (int i = tid; i < B_VEC_COUNT; i += blockDim.x)
-        {
+        // ------------------------
+        // Load B tile into shared memory (vectorized)
+        // ------------------------
+        for (int i = tid; i < B_VEC_COUNT; i += blockDim.x) {
             int row = i / B_VEC_WIDTH;
             int col = i % B_VEC_WIDTH;
 
-            // global index in int2 units
-            int gmem =
-                (k + row) * (N / VEC) + (blockCol / VEC) + col;
-                
+            int globalRow = k0 + row;
+            int globalCol = blockCol + col * VEC;
 
-            DT* sB_vec = reinterpret_cast<DT*>(&sB[row][col*VEC]);
-            *sB_vec = B_vec[gmem];
-        }
-
-        __syncthreads();
-
-            // WMMA compute: 16 tiles per block
-        int tile = 0;
-        for (int i = 0; i < BLOCK_M; i += WMMA_M) {       // 4 rows
-            for (int j = 0; j < BLOCK_N; j += WMMA_N) {   // 4 cols
-                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
-                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
-                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-
-                wmma::fill_fragment(c_frag, 0.0f);
-
-                for (int t = 0; t < BLOCK_K; t += WMMA_K) {
-                    wmma::load_matrix_sync(a_frag, &sA[i][t], BLOCK_K + PAD);
-                    wmma::load_matrix_sync(b_frag, &sB[t][j], BLOCK_N + PAD);
-                    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-                }
-
-                wmma::store_matrix_sync(&C[(blockRow + i) * N + (blockCol + j)], c_frag, N, wmma::mem_row_major);
-                tile++;
+            if (globalRow + VEC <= K && globalCol < N) {
+                DT* sB_vec = reinterpret_cast<DT*>(&sB[row][col * VEC]);
+                *sB_vec = B_vec[(globalRow * (N / VEC)) + (globalCol / VEC)];
             }
         }
 
         __syncthreads();
 
+        // ------------------------
+        // Compute WMMA fragments per warp
+        // ------------------------
+        for (int kk = 0; kk < BLOCK_K; kk += WMMA_K) {
+
+            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, TA, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, TB, wmma::row_major> b_frag;
+
+            // Load fragment from shared memory
+            wmma::load_matrix_sync(a_frag, &sA[tileRow][kk], BLOCK_K + PAD);
+            wmma::load_matrix_sync(b_frag, &sB[kk][tileCol], BLOCK_N + PAD);
+
+            // Perform matrix multiply-accumulate
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+
+        __syncthreads();
     }
+
+    // ------------------------
+    // Store result fragment
+    // ------------------------
+    wmma::store_matrix_sync(&C[(blockRow + tileRow) * N + (blockCol + tileCol)],
+                            c_frag, N, wmma::mem_row_major);
+}
  
     //--------------------------------
     // placeholder compute
@@ -452,7 +460,7 @@ __global__ void lds_load_vec(
     //         C[global_row * N + global_col] = val;
     //     }
     // }
-}
+// }
 
 int main(){
 
@@ -472,30 +480,31 @@ int main(){
     std::cout << "Compute capability: "
               << prop.major << "." << prop.minor << "\n";
     
-    using type_A = __half;
-    using type_B = __half;
-    using type_C = float;
+    using TA = __half;
+    using TB = __half;
+    using TC = __half;
 
-    int M = 2 * 1024, N = 2 * 1024, K = 32 * 1024;
+    int M = 1 * 1024, N = 2 * 1024, K = 32 * 1024;
 
     // constexpr size_t N_TILES = 4; // Number of tiles to compute per block (for shared_memory_increase_tensor_mat_mul_kernel)
 
-    std::vector<type_A> A(M*K, 1.0f);
-    std::vector<type_B> B(K*N, 1.0f);
-    std::vector<type_C> C(M*N, 0.0f);
+    std::vector<TA> A(M*K, 1.0f);
+    std::vector<TB> B(K*N, 1.0f);
+    std::vector<TC> C(M*N, 0.0f);
 
-    float *d_C;
-    half *d_A, *d_B;
+    TC *d_C;
+    TA *d_A;
+    TB *d_B;
     cuda_check(cudaMalloc((void**)&d_A, A.size()* sizeof(std::remove_reference_t<decltype(A[0])>)));
     cuda_check(cudaMalloc((void**)&d_B, B.size()* sizeof(std::remove_reference_t<decltype(B[0])>)));
     cuda_check(cudaMalloc((void**)&d_C, C.size()* sizeof(std::remove_reference_t<decltype(C[0])>)));
 
     cuda_check(cudaMemcpy(d_A, A.data(),
-                          A.size() * sizeof(type_A),
+                          A.size() * sizeof(TA),
                           cudaMemcpyHostToDevice));
 
     cuda_check(cudaMemcpy(d_B, B.data(),
-                          B.size() * sizeof(type_B),
+                          B.size() * sizeof(TB),
                           cudaMemcpyHostToDevice));
 
     constexpr int BLOCK_M = 64;  // 4 WMMAs tall (4*16)
@@ -510,7 +519,7 @@ int main(){
            dim_grid.x, dim_grid.y, dim_block.x, dim_block.y);
     printf("Per block: 64 WMMAs (8×8 WMMA grid; 8 warps each compute 8 WMMA tiles sequentially)\n");
     
-        lds_load_vec<half, half, float, BLOCK_M, BLOCK_N, BLOCK_K>
+        wmma_safe_kernel<TA, TB, TC, BLOCK_M, BLOCK_N, BLOCK_K>
         <<<dim_grid, dim_block>>>(d_A, d_B, d_C, M, N, K);
 
     // // Call optimized kernel with shared memory
@@ -524,7 +533,7 @@ int main(){
     // dim3 dim_grid1(M/(WMMA_M * N_TILES), N/WMMA_N);
 
     // printf("Executing tensor multiplication with shared memory optimization and increased load\n");
-    // shared_memory_increase_tensor_mat_mul_kernel<type_A, type_B, type_C, N_TILES><<<dim_grid1, dim_block1>>>(d_A, d_B, d_C, M, N, K);
+    // shared_memory_increase_tensor_mat_mul_kernel<TC, type_B, type_C, N_TILES><<<dim_grid1, dim_block1>>>(d_A, d_B, d_C, M, N, K);
 
     // dim3 dim_block2(512, 1);
     // dim3 dim_grid2(M/128, N/128);
@@ -541,7 +550,7 @@ int main(){
     cuda_check(cudaDeviceSynchronize());
 
     cuda_check(cudaMemcpy(C.data(), d_C,
-                          C.size() * sizeof(type_C),
+                          C.size() * sizeof(TC),
                           cudaMemcpyDeviceToHost));
 
     // Print result
@@ -552,4 +561,97 @@ int main(){
     cuda_check(cudaFree(d_B));
     cuda_check(cudaFree(d_C));
     return 0;
+
+
+    
 }
+
+// #include <iostream>
+// #include <cuda_runtime.h>
+
+// // CUTLASS GEMM API
+// #include "cutlass/cutlass.h"
+// #include "cutlass/gemm/device/gemm.h"
+
+// #define CUDA_CHECK(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+// inline void cudaAssert(cudaError_t code, const char *file, int line)
+// {
+//     if (code != cudaSuccess) {
+//         std::cerr << "CUDA Error: " << cudaGetErrorString(code)
+//                   << " at " << file << ":" << line << "\n";
+//         exit(EXIT_FAILURE);
+//     }
+// }
+
+// int main() {
+//     // Matrix sizes
+//     int M = 1024, N = 2*1024, K =32*1024;
+
+//     // Host data
+//     std::vector<cutlass::half_t> A(M * K, cutlass::half_t(1.0f));
+//     std::vector<cutlass::half_t> B(K * N, cutlass::half_t(1.0f));
+//     std::vector<cutlass::half_t> C(M * N, cutlass::half_t(0.0f));
+
+//     // Device buffers
+//     cutlass::half_t* d_A;
+//     cutlass::half_t* d_B;
+//     cutlass::half_t* d_C;
+
+//     CUDA_CHECK(cudaMalloc(&d_A, sizeof(cutlass::half_t) * M * K));
+//     CUDA_CHECK(cudaMalloc(&d_B, sizeof(cutlass::half_t) * K * N));
+//     CUDA_CHECK(cudaMalloc(&d_C, sizeof(cutlass::half_t) * M * N));
+
+//     CUDA_CHECK(cudaMemcpy(d_A, A.data(), sizeof(cutlass::half_t) * M * K, cudaMemcpyHostToDevice));
+//     CUDA_CHECK(cudaMemcpy(d_B, B.data(), sizeof(cutlass::half_t) * K * N, cudaMemcpyHostToDevice));
+
+//     //
+//     // Define CUTLASS GEMM type
+//     //
+//     using Gemm = cutlass::gemm::device::Gemm<
+//         cutlass::half_t,                // element A
+//         cutlass::layout::RowMajor,      // layout A
+//         cutlass::half_t,                // element B
+//         cutlass::layout::RowMajor,      // layout B
+//         cutlass::half_t,                // element C / D (output)
+//         cutlass::layout::RowMajor,
+//         float,                          // accumulator type
+//         cutlass::arch::OpClassTensorOp, // target Tensor Cores
+//         cutlass::arch::Sm80,            // compute capability (adjust as needed)
+//         cutlass::gemm::GemmShape<64,64,64>,     // Threadblock tile shape
+//         cutlass::gemm::GemmShape<32,32,32>,       // Warp tile shape
+//         cutlass::gemm::GemmShape<16,8,16>,        // Instruction tile
+//         cutlass::epilogue::thread::LinearCombination<
+//             cutlass::half_t, 1, float, float>,
+//         cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+//         2 /* Stages */
+//     >;
+
+//     Gemm gemm_op;
+
+//     cutlass::Status status;
+
+//     // Arguments: {ProblemSize}, {A, lda}, {B, ldb}, {C, ldc}, {D, ldd}, {alpha, beta}
+//     status = gemm_op({
+//         { M, N, K },
+//         { d_A, K },
+//         { d_B, N },
+//         { d_C, N },
+//         { d_C, N },
+//         { 1.0f, 0.0f }
+//     });
+
+//     if (status != cutlass::Status::kSuccess) {
+//         std::cerr << "CUTLASS GEMM failed with status: " << int(status) << "\n";
+//         return -1;
+//     }
+
+//     CUDA_CHECK(cudaMemcpy(C.data(), d_C, sizeof(cutlass::half_t) * M * N, cudaMemcpyDeviceToHost));
+
+//     std::cout << "C[0] = " << float(C[0]) << "\n";
+
+//     cudaFree(d_A);
+//     cudaFree(d_B);
+//     cudaFree(d_C);
+
+//     return 0;
+// }

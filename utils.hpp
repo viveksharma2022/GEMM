@@ -13,3 +13,10 @@ namespace Utils{
     }
 }
 
+// CUDA Error Checking
+#define cuda_check(err) { \
+    if (err != cudaSuccess) { \
+        std::cout << cudaGetErrorString(err) << " in " << __FILE__ << " at line " << __LINE__ << "\n"; \
+        exit(EXIT_FAILURE); \
+    } \
+}

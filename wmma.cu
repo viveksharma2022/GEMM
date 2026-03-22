@@ -7,28 +7,35 @@
 #include <iostream>
 #include "utils.hpp"
 #include <cuda/pipeline>
+#include <cooperative_groups.h>
 #include <cuda.h>
 #include <cuda/barrier>
+#include <cuda_pipeline.h>
 
 using namespace nvcuda;
- 
+namespace cg = cooperative_groups; 
+
 template<typename TA, typename TB, typename TC>
-__global__ void wmma_test(TC* __restrict__ out,
+__global__ void wmma_test( 
+    TA* __restrict__ a,
+    TB* __restrict__ b,
+    TC* __restrict__ out,
     int M, int N, int K) {
 
     constexpr int WMMA_M = 16;
     constexpr int WMMA_N = 16;
     constexpr int WMMA_K = 16;
     constexpr int PAD = 8; // to avoid bank conflicts
-    constexpr int N_TILES = 16;
-    constexpr int NUM_ACCS = 2; // number of accumulators per warp
+    constexpr int N_TILES = 8;
+    constexpr int NUM_ACCS = 4; // number of accumulators per warp
 
-    __shared__ __align__(256) TA shared_memA[WMMA_M * (WMMA_K + PAD) * N_TILES];
-    __shared__ __align__(256) TB shared_memB[WMMA_K * (WMMA_N + PAD) * N_TILES];
+    __shared__ __align__(256) TA shared_memA[2][WMMA_M * (WMMA_K + PAD) * N_TILES];
+    __shared__ __align__(256) TB shared_memB[2][WMMA_K * (WMMA_N + PAD) * N_TILES];
 
     int warp_id = threadIdx.x / 32;
     int lane = threadIdx.x;
 
+    int tid = blockIdx.y * gridDim.x * blockDim.x + blockIdx.x * blockDim.x + threadIdx.x;
 
     wmma::fragment<wmma::matrix_a,16,16,16,TA,wmma::row_major> a_frag[NUM_ACCS];
     wmma::fragment<wmma::matrix_b,16,16,16,TB,wmma::row_major> b_frag[NUM_ACCS];
@@ -39,63 +46,51 @@ __global__ void wmma_test(TC* __restrict__ out,
         wmma::fill_fragment(c_frag[i], 0.0f);
     }
 
-    // Load the 0th tile for the first accumulator to get things going
-    wmma::load_matrix_sync(a_frag[0], &shared_memA[warp_id * WMMA_M * (WMMA_K + PAD)], WMMA_K + PAD);
-    wmma::load_matrix_sync(b_frag[0], &shared_memB[warp_id * WMMA_K * (WMMA_N + PAD)], WMMA_N + PAD);
+    // initialize shared memory.. load the first kth tile 
+    int idx = 0;
+    if (lane < WMMA_M * WMMA_K * N_TILES) {
+        shared_memA[idx%2][lane] = a[tid];
+        shared_memB[idx%2][lane] = b[tid];
+    }
+    __syncthreads();
 
+    // Pipeline setup
+    __shared__ cuda::pipeline_shared_state<
+        cuda::thread_scope_block, 2> pipe_state;
+
+    auto block = cg::this_thread_block();
+    auto pipe = cuda::make_pipeline(block, &pipe_state);
 
     #pragma unroll
     for(int k = 0; k < K; k += WMMA_K * N_TILES * NUM_ACCS) { // *2 for double buffering
 
-        // initialize shared memory
         if (lane < WMMA_M * WMMA_K * N_TILES) {
-            shared_memA[lane] = __float2half(1.0f);
-            shared_memB[lane] = __float2half(1.0f);
+            pipe.producer_acquire();
+            cuda::memcpy_async(&shared_memA[(idx+1)%2][lane], &a[tid], sizeof(TA), pipe);
+            cuda::memcpy_async(&shared_memB[(idx+1)%2][lane], &b[tid], sizeof(TB), pipe);
+            pipe.producer_commit();
         }
-        __syncthreads();
-
-        // wmma::load_matrix_sync(a_frag, &shared_memA[warp_id * WMMA_M * (WMMA_K + PAD)], WMMA_K + PAD);
-        // wmma::load_matrix_sync(b_frag, &shared_memB[warp_id * WMMA_K * (WMMA_N + PAD)], WMMA_N + PAD);
-
-        // // fake compute to keep everything alive
-        // wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         
-        int i = 0;
         #pragma unroll
-        for(; i < NUM_ACCS-1; i++) {
+        for(int i = 0; i < NUM_ACCS; i++) {
 
-            // compute previous tile while loading next tile (overlap compute with memory ops)
+            const auto* ptrA = &shared_memA[idx %2][(warp_id + (i) * WMMA_K * N_TILES) * WMMA_M * (WMMA_K + PAD)];
+            const auto* ptrB = &shared_memB[idx %2][(warp_id + (i) * WMMA_K * N_TILES) * WMMA_K * (WMMA_N + PAD)];
+
+            wmma::load_matrix_sync(a_frag[i], ptrA, WMMA_K + PAD);
+            wmma::load_matrix_sync(b_frag[i], ptrB, WMMA_N + PAD);
+
+        }
+
+        #pragma unroll
+        for(int i = 0; i < NUM_ACCS; i++)   
             wmma::mma_sync(c_frag[i], a_frag[i], b_frag[i], c_frag[i]);
 
-            const auto* ptrA = &shared_memA[(warp_id + (i+1) * WMMA_K * N_TILES) * WMMA_M * (WMMA_K + PAD)];
-            const auto* ptrB = &shared_memB[(warp_id + (i+1) * WMMA_K * N_TILES) * WMMA_K * (WMMA_N + PAD)];
-            
-            wmma::load_matrix_sync(a_frag[i+1], ptrA, WMMA_K + PAD);
-            wmma::load_matrix_sync(b_frag[i+1], ptrB, WMMA_N + PAD);
 
-        }
+        pipe.consumer_wait();
+        pipe.consumer_release();
+        idx++;
 
-        // compute last tile
-        wmma::mma_sync(c_frag[i], a_frag[i], b_frag[i], c_frag[i]);
-
-        // auto ptrA0 = &shared_memA[warp_id * WMMA_M * (WMMA_K + PAD)];
-        // auto ptrB0 = &shared_memB[warp_id * WMMA_K * (WMMA_N + PAD)];
-        // auto ptrA1 = &shared_memA[(warp_id + WMMA_K * N_TILES) * WMMA_M * (WMMA_K + PAD)];
-        // auto ptrB1 = &shared_memB[(warp_id + WMMA_K * N_TILES) * WMMA_K * (WMMA_N + PAD)];
-
-        //         // ---- tile 0 ----
-        // #pragma unroll
-
-        // wmma::load_matrix_sync(a_frag0, ptrA0, WMMA_K + PAD);
-        // wmma::load_matrix_sync(b_frag0, ptrB0, WMMA_N + PAD);
-
-        // // ---- tile 1 ----
-        // wmma::load_matrix_sync(a_frag1, ptrA1, WMMA_K + PAD);
-        // wmma::load_matrix_sync(b_frag1, ptrB1, WMMA_N + PAD);
-
-        // // compute (independent)
-        // wmma::mma_sync(c_frag0, a_frag0, b_frag0, c_frag0);
-        // wmma::mma_sync(c_frag1, a_frag1, b_frag1, c_frag1);
     }
 
     int warps_per_block = blockDim.x / 32;
@@ -117,18 +112,23 @@ __global__ void wmma_test(TC* __restrict__ out,
 
 int main() {
  
-    constexpr size_t M = 1*1024, N = 1*1024, K = 16*1024;
-    dim3 thread_blocks = 512;
-    dim3 dim_grid(N / 32, M / 16);
+    constexpr size_t M = 1*1024, N = 4*1024, K = 16*1024;
+    dim3 thread_blocks = 256;
+    dim3 dim_grid(N / 16 , M / 16);
     
     using TA = half;
     using TB = half;
     using TC = float;
 
+    TA* a;
+    TB* b;
     TC* c_out;
+
+    cuda_check(cudaMalloc(&a, M * K * sizeof(TA)));
+    cuda_check(cudaMalloc(&b, K * N * sizeof(TB )));
     cuda_check(cudaMalloc(&c_out, M * N * sizeof(TC)));
 
-    wmma_test<TA, TB, TC><<<dim_grid, thread_blocks>>>(c_out, M, N, K);
+    wmma_test<TA, TB, TC><<<dim_grid, thread_blocks>>>(a, b, c_out, M, N, K);
     cuda_check(cudaDeviceSynchronize());
     return 0;
 }

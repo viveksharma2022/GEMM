@@ -97,9 +97,9 @@ namespace GEMM_CPU {
     template<typename T>
     requires (std::is_arithmetic_v<T>)
     void matmul_cache_simd(T *A, T *B, T *C, int M, int N, int K ){
-        constexpr int blockM = 512;
-        constexpr int blockN = 512;
-        constexpr int blockK = 512;
+        constexpr int blockM = 64;
+        constexpr int blockN = 64;
+        constexpr int blockK = 64;
 
         using traits = simd_traits<T>;
         using vec_type = typename traits::vec_type;
@@ -113,7 +113,7 @@ namespace GEMM_CPU {
                         for(int bj = j; bj < j + blockN; bj++){
                             vec_type c_vec = traits::setzero();
 
-                            for(int bk = k; bk < k + 8; bk += 8) {
+                            for(int bk = k; bk < k + blockK; bk += 8) {
                                 vec_type a_vec;
                                 if constexpr(std::is_same_v<T,float>)
                                     a_vec = traits::set1(A[bi*K + bk]);
